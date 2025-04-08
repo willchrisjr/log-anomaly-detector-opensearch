@@ -29,3 +29,7 @@ alerting:
     # headers:
     #   Content-Type: 'application/json'
     #   Authorization: 'Bearer your_token'
+
+scheduler:
+  # How often to run the detection logic
+  interval_minutes: 10

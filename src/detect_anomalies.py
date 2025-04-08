@@ -20,8 +20,11 @@ import logging
 import sys
 import os
 import json
+import time # For sleep in main loop
+import signal # For graceful shutdown
 import requests # For sending webhooks
 from opensearchpy import OpenSearch, RequestsHttpConnection
+from apscheduler.schedulers.blocking import BlockingScheduler # Import scheduler
 from config_loader import load_config # Import the loader
 
 # Setup basic logging for script operation messages
@@ -62,6 +65,13 @@ try:
     # WEBHOOK_HEADERS = ALERT_CONFIG.get('generic_webhook', {}).get('headers', {}) # Optional
 except KeyError as e:
     logging.error(f"Missing required alerting configuration key: {e}. Exiting.")
+    sys.exit(1)
+
+# --- Scheduler Settings ---
+try:
+    SCHEDULER_INTERVAL_MINUTES = config['scheduler']['interval_minutes']
+except KeyError as e:
+    logging.error(f"Missing required scheduler configuration key: {e}. Exiting.")
     sys.exit(1)
 
 # --- Alert Logger Setup ---
@@ -268,4 +278,72 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"An unexpected error occurred during anomaly detection: {e}", exc_info=True)
 
-    logging.info("Anomaly detection script finished.")
+# --- Job Function ---
+def run_detection_job():
+    """Connects to OpenSearch and runs the detection logic."""
+    logging.info("Running scheduled detection job...")
+    try:
+        os_client = create_opensearch_client() 
+        if os_client.indices.exists(index=OPENSEARCH_INDEX_NAME): 
+            detect_failed_logins(os_client, OPENSEARCH_INDEX_NAME, TIME_WINDOW_MINUTES, FAILURE_THRESHOLD) 
+        else:
+            logging.error(f"Index '{OPENSEARCH_INDEX_NAME}' does not exist. Cannot run detection job.")
+            
+    except ValueError as ve: # Catch connection errors
+        logging.error(f"Connection error during detection job: {ve}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during detection job: {e}", exc_info=True)
+    logging.info("Scheduled detection job finished.")
+
+
+# --- Main Execution ---
+
+# Flag to control the main loop for graceful shutdown
+running = True
+
+def shutdown_handler(signum, frame):
+    """Handles signals like SIGINT (Ctrl+C) for graceful shutdown."""
+    global running
+    logging.info(f"Received signal {signum}. Shutting down scheduler...")
+    running = False
+    # The BlockingScheduler should exit automatically when the main thread finishes,
+    # but we can also explicitly shut it down if needed (requires scheduler instance).
+    # If using BackgroundScheduler, you'd call scheduler.shutdown() here.
+
+# Register signal handlers
+signal.signal(signal.SIGINT, shutdown_handler)
+signal.signal(signal.SIGTERM, shutdown_handler)
+
+
+if __name__ == "__main__":
+    logging.info(f"Starting anomaly detection scheduler. Detection interval: {SCHEDULER_INTERVAL_MINUTES} minutes.")
+    
+    # Run the job once immediately on startup
+    run_detection_job() 
+    
+    # Initialize the scheduler
+    scheduler = BlockingScheduler(timezone="UTC") # Use UTC timezone
+
+    # Add the job to run at the configured interval
+    scheduler.add_job(
+        run_detection_job, 
+        'interval', 
+        minutes=SCHEDULER_INTERVAL_MINUTES,
+        id='failed_login_detector', # Give the job an ID
+        replace_existing=True # Replace if job with same ID exists (e.g., on restart)
+    )
+    
+    logging.info("Scheduler started. Press Ctrl+C to exit.")
+
+    try:
+        # Start the scheduler (this blocks the main thread)
+        scheduler.start()
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Scheduler stopped via interrupt.")
+    except Exception as e:
+        logging.error(f"Scheduler failed: {e}", exc_info=True)
+    finally:
+        # Optional cleanup if scheduler needs explicit shutdown
+        if scheduler.running:
+             scheduler.shutdown()
+        logging.info("Anomaly detection scheduler finished.")

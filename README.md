@@ -1,6 +1,39 @@
-s# End-to-End Security Automation & Incident Response Framework (Proof of Concept)
+# Automated Log Analysis and Anomaly Detection System (OpenSearch/Python/React)
 
-This project is a proof-of-concept implementation of a framework designed to ingest security logs, detect anomalies, and trigger basic alerts. It currently focuses on ingesting mock SSH logs into a local OpenSearch instance and detecting multiple failed login attempts from the same IP address.
+This project provides a comprehensive framework designed to enhance security monitoring by ingesting various log sources (initially SSH and Apache Web Logs) into OpenSearch. It leverages configurable rules to automatically detect suspicious activities and potential security anomalies within the ingested data. Detected events trigger alerts dispatched through multiple configurable channels (log file, webhook, dedicated OpenSearch index). A backend API serves processed alerts and raw log samples to a user-friendly React frontend, offering a centralized dashboard for visualizing security events. The entire system is designed with modularity and extensibility in mind, running key components like OpenSearch within a convenient Docker environment.
+
+
+## Screenshot
+
+**React Frontend UI - Main View:**
+![React Frontend UI](./images/screenshot-frontend-main.png) 
+
+
+
+## Key Features
+
+*   **Multi-Source Log Ingestion:** Parses and indexes SSH (`sshd`) and Apache Combined Format (`web`) logs into a central OpenSearch index.
+*   **Rule-Based Anomaly Detection:** Periodically scans ingested logs for configurable patterns:
+    *   Multiple failed SSH login attempts from the same IP.
+    *   High volume of HTTP 404 (Not Found) errors from a single client IP.
+*   **Flexible Configuration:** Easily customize detection logic (thresholds, time windows), OpenSearch connection details, index names, and alerting behavior via `config/config.yaml`.
+*   **Multi-Channel Alerting:** Dispatches alerts via:
+    *   Local file logging (`logs/alerts.log`).
+    *   Generic webhook endpoint (configurable).
+    *   Dedicated OpenSearch index (`security-alerts-details`) for structured alert storage and querying.
+*   **Backend API:** A Flask API serves structured alerts and recent raw log samples.
+*   **Web Dashboard:** A React (Vite) frontend provides a dashboard to visualize alerts and logs fetched from the API.
+*   **Dockerized OpenSearch:** Includes `docker-compose.yml` for easy setup of OpenSearch and OpenSearch Dashboards locally.
+*   **Unit Testing:** Basic tests for log parsing logic included.
+
+## Architecture Overview
+
+1.  **Ingestion (`src/ingest_logs.py`):** Reads log files, parses lines using regex, enriches with metadata (`log_type`, `@timestamp`), and bulk indexes into the primary OpenSearch index (e.g., `ssh-logs`).
+2.  **Detection (`src/detect_anomalies.py`):** Runs as a scheduled job (APScheduler). Queries the primary OpenSearch index based on enabled rules in `config.yaml`. Generates alert data upon detecting anomalies.
+3.  **Alerting:** The detection script dispatches generated alerts to configured destinations: file, webhook, and/or the dedicated OpenSearch alert index (e.g., `security-alerts-details`).
+4.  **API (`src/api.py`):** Flask server endpoints (`/api/alerts`, `/api/raw_logs`) query the relevant OpenSearch indices to provide data for the frontend.
+5.  **Frontend (`frontend/`):** React application that calls the API to fetch and display alerts and log samples.
+6.  **OpenSearch (Docker):** `docker-compose.yml` manages OpenSearch and OpenSearch Dashboards containers, providing the data storage and powerful query/visualization backend.
 
 ## Project Structure
 

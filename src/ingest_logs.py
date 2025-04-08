@@ -8,17 +8,40 @@ the processed log data.
 """
 import re
 import datetime
-import logging # Added for better logging
+import logging 
+import sys # For exiting on config error
 from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
+from config_loader import load_config # Import the loader
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Configuration
-OPENSEARCH_HOST = 'localhost'
-OPENSEARCH_PORT = 9200
-INDEX_NAME = 'ssh-logs'
-LOG_FILE_PATH = 'data/mock_ssh.log'
+# Load configuration
+config = load_config()
+if not config:
+    logging.error("Failed to load configuration. Exiting.")
+    sys.exit(1)
+
+# Get settings from config
+try:
+    # Define constants from config for use in functions (could pass config dict instead)
+    OPENSEARCH_HOST = config['opensearch']['host']
+    OPENSEARCH_PORT = config['opensearch']['port']
+    # INDEX_NAME constant is no longer needed globally, read from config where needed
+    # Optional auth - add later if needed
+    # OPENSEARCH_USER = config['opensearch'].get('user') 
+    # OPENSEARCH_PASSWORD = config['opensearch'].get('password')
+    # USE_SSL = config['opensearch'].get('use_ssl', False)
+    # VERIFY_CERTS = config['opensearch'].get('verify_certs', False)
+    
+    # Assuming log file path is still relative or defined elsewhere if needed
+    # If LOG_FILE_PATH needs to be configurable, add it to config.yaml
+    LOG_FILE_PATH = 'data/mock_ssh.log' 
+
+except KeyError as e:
+    logging.error(f"Missing required configuration key: {e}. Exiting.")
+    sys.exit(1)
+
 
 # Regex to parse the log line (simple example)
 # Example: Apr 8 10:15:30 server1 sshd[1234]: Message
@@ -104,12 +127,14 @@ def create_opensearch_client():
     Raises:
         ValueError: If the connection to OpenSearch fails.
     """
+    # TODO: Add support for SSL and authentication based on config
     client = OpenSearch(
-        hosts=[{'host': OPENSEARCH_HOST, 'port': OPENSEARCH_PORT}],
-        http_conn_options={'timeout': 10}, # Add timeout
-        use_ssl=False, # Assuming local instance without SSL
-        verify_certs=False,
-        ssl_show_warn=False,
+        # Using constants derived from config at the top level
+        hosts=[{'host': OPENSEARCH_HOST, 'port': OPENSEARCH_PORT}], 
+        http_conn_options={'timeout': 10}, 
+        use_ssl=False, # Replace with USE_SSL from config if added
+        verify_certs=False, # Replace with VERIFY_CERTS from config if added
+        ssl_show_warn=False, 
         connection_class=RequestsHttpConnection # Recommended for compatibility
     )
     # Verify connection
@@ -183,18 +208,22 @@ if __name__ == "__main__":
     logging.info("Starting log ingestion script...")
     
     try:
-        os_client = create_opensearch_client()
+        # Client uses constants derived from config
+        os_client = create_opensearch_client() 
         # Ensure index exists with the correct mapping before ingesting
-        create_index_if_not_exists(os_client, INDEX_NAME) 
+        # Pass index name directly from config dict
+        index_name_from_config = config['opensearch']['index_name']
+        create_index_if_not_exists(os_client, index_name_from_config) 
         
-        logging.info(f"Reading logs from {LOG_FILE_PATH} and indexing to '{INDEX_NAME}'...")
+        logging.info(f"Reading logs from {LOG_FILE_PATH} and indexing to '{index_name_from_config}'...")
         
         # Use bulk helper for efficiency
         success_count, errors = helpers.bulk(
             os_client,
-            generate_actions(LOG_FILE_PATH, INDEX_NAME),
-            chunk_size=500,  # Adjust as needed
-            request_timeout=60 # Increase timeout for bulk operations
+             # Pass index name directly from config dict
+            generate_actions(LOG_FILE_PATH, index_name_from_config),
+            chunk_size=500,  # TODO: Make chunk_size configurable?
+            request_timeout=60 # TODO: Make timeout configurable?
         )
         
         logging.info(f"Successfully indexed {success_count} log entries.")

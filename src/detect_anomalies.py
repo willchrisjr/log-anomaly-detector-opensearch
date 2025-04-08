@@ -6,22 +6,88 @@ SSH login attempts originating from the same IP address within a defined
 time window. It prints basic alerts to the console if the failure count
 for an IP exceeds a set threshold.
 """
+"""
+Detects anomalies in SSH log data stored in OpenSearch.
+
+Specifically, this script queries an OpenSearch index for multiple failed
+SSH login attempts originating from the same IP address within a defined
+time window. It dispatches alerts via configured methods (log file, webhook)
+if the failure count for an IP exceeds a set threshold.
+"""
 import re
 import datetime
-import logging # Added for better logging
+import logging
+import sys
+import os
+import json
+import requests # For sending webhooks
 from opensearchpy import OpenSearch, RequestsHttpConnection
+from config_loader import load_config # Import the loader
 
-# Setup basic logging
+# Setup basic logging for script operation messages
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Configuration (should match ingest_logs.py for connection)
-OPENSEARCH_HOST = 'localhost'
-OPENSEARCH_PORT = 9200
-INDEX_NAME = 'ssh-logs'
+# --- Configuration Loading ---
+config = load_config()
+if not config:
+    logging.error("Failed to load configuration. Exiting.")
+    sys.exit(1)
 
-# Anomaly Detection Parameters
-TIME_WINDOW_MINUTES = 1440 # Look for failures in the last 24 hours (to catch mock data)
-FAILURE_THRESHOLD = 3    # Trigger alert if >= X failures from the same IP
+# --- OpenSearch Settings ---
+try:
+    OPENSEARCH_HOST = config['opensearch']['host']
+    OPENSEARCH_PORT = config['opensearch']['port']
+    OPENSEARCH_INDEX_NAME = config['opensearch']['index_name']
+    # Optional auth - add later if needed
+except KeyError as e:
+    logging.error(f"Missing required opensearch configuration key: {e}. Exiting.")
+    sys.exit(1)
+
+# --- Detection Settings ---
+try:
+    DETECTION_RULE = config['detection']['failed_login_rule']
+    TIME_WINDOW_MINUTES = DETECTION_RULE['time_window_minutes']
+    FAILURE_THRESHOLD = DETECTION_RULE['failure_threshold']
+except KeyError as e:
+    logging.error(f"Missing required detection configuration key: {e}. Exiting.")
+    sys.exit(1)
+
+# --- Alerting Settings ---
+try:
+    ALERT_CONFIG = config['alerting']
+    LOG_ALERT_ENABLED = ALERT_CONFIG.get('log_file', {}).get('enabled', False)
+    LOG_ALERT_PATH = ALERT_CONFIG.get('log_file', {}).get('path', 'logs/alerts.log')
+    WEBHOOK_ALERT_ENABLED = ALERT_CONFIG.get('generic_webhook', {}).get('enabled', False)
+    WEBHOOK_URL = ALERT_CONFIG.get('generic_webhook', {}).get('url')
+    # WEBHOOK_HEADERS = ALERT_CONFIG.get('generic_webhook', {}).get('headers', {}) # Optional
+except KeyError as e:
+    logging.error(f"Missing required alerting configuration key: {e}. Exiting.")
+    sys.exit(1)
+
+# --- Alert Logger Setup ---
+alert_logger = None
+if LOG_ALERT_ENABLED:
+    try:
+        # Ensure logs directory exists
+        log_dir = os.path.dirname(LOG_ALERT_PATH)
+        if log_dir and not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+            logging.info(f"Created log directory: {log_dir}")
+
+        alert_logger = logging.getLogger('AlertLogger')
+        alert_logger.setLevel(logging.WARNING) # Log alerts as warnings or higher
+        # Prevent alert logs from propagating to the root logger (which prints to console)
+        alert_logger.propagate = False 
+        # Use a simple format for the alert file
+        formatter = logging.Formatter('%(asctime)s - ALERT - %(message)s') 
+        file_handler = logging.FileHandler(LOG_ALERT_PATH)
+        file_handler.setFormatter(formatter)
+        alert_logger.addHandler(file_handler)
+        logging.info(f"Alert logging enabled. Alerts will be written to: {LOG_ALERT_PATH}")
+    except Exception as e:
+        logging.error(f"Failed to set up alert file logger at {LOG_ALERT_PATH}: {e}")
+        alert_logger = None # Disable if setup fails
+
 
 # Regex to extract IP address from failed password messages
 # Example: Failed password for user1 from 192.168.1.10 port 54322 ssh2
@@ -41,10 +107,11 @@ def create_opensearch_client():
     Raises:
         ValueError: If the connection to OpenSearch fails.
     """
+    # TODO: Add support for SSL and authentication based on config
     client = OpenSearch(
-        hosts=[{'host': OPENSEARCH_HOST, 'port': OPENSEARCH_PORT}],
+        hosts=[{'host': OPENSEARCH_HOST, 'port': OPENSEARCH_PORT}], # Use constants derived from config
         http_conn_options={'timeout': 10},
-        use_ssl=False,
+        use_ssl=False, # Replace with config value if added
         verify_certs=False,
         ssl_show_warn=False,
         connection_class=RequestsHttpConnection
@@ -55,9 +122,52 @@ def create_opensearch_client():
     logging.info("Successfully connected to OpenSearch.")
     return client
 
-# Unused function removed: extract_ip_from_message
+# --- Alerting Functions ---
 
-def detect_failed_logins(client, index, time_window_minutes, failure_threshold):
+def send_webhook_alert(alert_data):
+    """Sends alert data to the configured generic webhook."""
+    if not WEBHOOK_URL:
+        logging.error("Webhook URL is not configured. Cannot send webhook alert.")
+        return
+
+    headers = {'Content-Type': 'application/json'}
+    # TODO: Add custom headers from config if needed
+    
+    # Structure the alert data as JSON payload
+    payload = {
+        "alert_type": "failed_logins",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "details": alert_data # Pass the list of suspicious IPs
+    }
+    
+    try:
+        response = requests.post(WEBHOOK_URL, headers=headers, json=payload, timeout=15)
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+        logging.info(f"Successfully sent alert to webhook: {WEBHOOK_URL}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error sending alert to webhook {WEBHOOK_URL}: {e}")
+
+def dispatch_alert(suspicious_ips_list):
+    """Dispatches alerts based on configuration (log file, webhook)."""
+    if not suspicious_ips_list:
+        return # No alerts to dispatch
+
+    alert_summary = f"Found {len(suspicious_ips_list)} suspicious IPs meeting threshold ({FAILURE_THRESHOLD})."
+    
+    # Log to file if enabled
+    if alert_logger:
+        alert_logger.warning(alert_summary)
+        for item in suspicious_ips_list:
+             alert_logger.warning(f"  IP: {item['ip']}, Failures: {item['count']}")
+    
+    # Send to webhook if enabled
+    if WEBHOOK_ALERT_ENABLED:
+        send_webhook_alert(suspicious_ips_list)
+
+
+# --- Detection Logic ---
+
+def detect_failed_logins(client, index_name, time_window_minutes, failure_threshold):
     """
     Queries OpenSearch for multiple failed logins from the same IP within a specified time window.
 
@@ -66,11 +176,11 @@ def detect_failed_logins(client, index, time_window_minutes, failure_threshold):
 
     Args:
         client (OpenSearch): The OpenSearch client instance.
-        index (str): The name of the index to query.
+        index_name (str): The name of the index to query.
         time_window_minutes (int): The lookback period in minutes.
         failure_threshold (int): The minimum number of failures to trigger an alert.
     """
-    logging.info(f"Searching index '{index}' for IPs with >= {failure_threshold} failed logins in the last {time_window_minutes} minutes...")
+    logging.info(f"Searching index '{index_name}' for IPs with >= {failure_threshold} failed logins in the last {time_window_minutes} minutes...")
     
     # Calculate the start time for the query window
     now = datetime.datetime.now(datetime.timezone.utc) # Use timezone-aware UTC time
@@ -95,7 +205,7 @@ def detect_failed_logins(client, index, time_window_minutes, failure_threshold):
             "failed_logins_by_ip": {
                 "terms": {
                     "field": "ip_address", # Aggregate on the keyword IP field
-                    "size": 100 # Limit number of IPs returned
+                    "size": 100 # Limit number of IPs returned - TODO: Make configurable?
                     }, 
                 "aggs": {
                     "min_failure_count": {
@@ -111,7 +221,7 @@ def detect_failed_logins(client, index, time_window_minutes, failure_threshold):
 
     try:
         # Execute the search
-        response = client.search(index=index, body=query)
+        response = client.search(index=index_name, body=query)
         
         # Process the aggregation results
         suspicious_ips = []
@@ -120,7 +230,7 @@ def detect_failed_logins(client, index, time_window_minutes, failure_threshold):
         failed_logins_agg = aggregations.get('failed_logins_by_ip', {})
         buckets = failed_logins_agg.get('buckets', [])
         
-        logging.info(f"Aggregation query returned {len(buckets)} IPs meeting the threshold.")
+        logging.info(f"OpenSearch query returned {len(buckets)} IPs meeting the threshold.")
 
         for bucket in buckets:
             ip = bucket.get('key')
@@ -128,34 +238,33 @@ def detect_failed_logins(client, index, time_window_minutes, failure_threshold):
             if ip: # Should always have an IP here now
                  suspicious_ips.append({"ip": ip, "count": count})
 
-
-        logging.info("--- Anomaly Detection Results ---")
+        # Dispatch alerts if any suspicious IPs were found
         if suspicious_ips:
-            logging.warning(f"Found {len(suspicious_ips)} suspicious IPs meeting threshold ({failure_threshold}). Triggering alerts:")
-            # Simulate triggering an alert for each suspicious IP
-            for item in suspicious_ips:
-                # Using warning level for alerts to make them stand out
-                logging.warning(f"ALERT: High number of failed logins ({item['count']}) detected from IP: {item['ip']}")
+             dispatch_alert(suspicious_ips)
         else:
             logging.info("No suspicious IPs found meeting the threshold.")
-        logging.info("-------------------------------")
 
     except Exception as e:
         logging.error(f"Error querying or processing results from OpenSearch: {e}", exc_info=True)
 
 
+# --- Main Execution ---
+
 if __name__ == "__main__":
     logging.info("Starting anomaly detection script...")
     try:
-        os_client = create_opensearch_client()
+        # Client uses constants derived from config
+        os_client = create_opensearch_client() 
         # Check if index exists before querying
-        if os_client.indices.exists(index=INDEX_NAME):
-            detect_failed_logins(os_client, INDEX_NAME, TIME_WINDOW_MINUTES, FAILURE_THRESHOLD)
+        # Use index name from config
+        if os_client.indices.exists(index=OPENSEARCH_INDEX_NAME): 
+            # Pass config values to detection function
+            detect_failed_logins(os_client, OPENSEARCH_INDEX_NAME, TIME_WINDOW_MINUTES, FAILURE_THRESHOLD) 
         else:
-            logging.error(f"Index '{INDEX_NAME}' does not exist. Run the ingestion script first.")
+            logging.error(f"Index '{OPENSEARCH_INDEX_NAME}' does not exist. Run the ingestion script first.")
             
-    except ValueError as ve:
-        logging.error(f"Configuration or Connection error: {ve}")
+    except ValueError as ve: # Catch connection errors from create_opensearch_client
+        logging.error(f"Connection error: {ve}")
     except Exception as e:
         logging.error(f"An unexpected error occurred during anomaly detection: {e}", exc_info=True)
 

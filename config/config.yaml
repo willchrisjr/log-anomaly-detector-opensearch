@@ -1,0 +1,31 @@
+# Configuration for the Security Automation Framework
+
+opensearch:
+  host: 'localhost'
+  port: 9200
+  index_name: 'ssh-logs'
+  # Optional: Add credentials if security is enabled
+  # user: 'admin'
+  # password: 'your_password'
+  # use_ssl: true
+  # verify_certs: true
+
+detection:
+  # Rule: Failed Logins
+  failed_login_rule:
+    time_window_minutes: 1440 # Lookback period (minutes)
+    failure_threshold: 3    # Minimum failures to trigger alert
+
+alerting:
+  log_file:
+    enabled: true # Log alerts to a file?
+    path: 'logs/alerts.log' # Path relative to project root
+    # Optional: Configure log format, rotation later if needed
+
+  generic_webhook:
+    enabled: false # Send alerts to a webhook?
+    url: 'YOUR_WEBHOOK_URL_HERE' # The webhook endpoint URL
+    # Optional: Add custom headers if needed by the endpoint
+    # headers:
+    #   Content-Type: 'application/json'
+    #   Authorization: 'Bearer your_token'

@@ -1,0 +1,49 @@
+# docker-compose.yml
+services:
+  opensearch-node1:
+    image: opensearchproject/opensearch:latest # Use the latest official image
+    container_name: opensearch-node1
+    environment:
+      - cluster.name=opensearch-cluster
+      - node.name=opensearch-node1
+      - discovery.seed_hosts=opensearch-node1
+      - cluster.initial_cluster_manager_nodes=opensearch-node1
+      - bootstrap.memory_lock=true # Disable JVM heap memory swapping
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m" # Set min/max JVM heap size
+      - "DISABLE_INSTALL_DEMO_CONFIG=true" # Don't install demo data
+      - "DISABLE_SECURITY_PLUGIN=true" # Disable security for easier local dev (DO NOT use in production)
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536 # Increase max number of open files
+        hard: 65536
+    volumes:
+      - opensearch-data1:/usr/share/opensearch/data # Persist data
+    ports:
+      - "9200:9200" # REST API
+      - "9600:9600" # Performance Analyzer
+    networks:
+      - opensearch-net
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:latest
+    container_name: opensearch-dashboards
+    ports:
+      - "5601:5601" # Dashboards UI
+    expose:
+      - "5601"
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch-node1:9200"]' # Connect to the OpenSearch node
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true" # Disable security for easier local dev
+    networks:
+      - opensearch-net
+    depends_on:
+      - opensearch-node1
+
+volumes:
+  opensearch-data1: # Define the data volume
+
+networks:
+  opensearch-net: # Define the network

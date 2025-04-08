@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+*.coverage
+*.cache
+*.pytest_cache/
+.hypothesis/
+
+# Virtual environment
+venv/
+env/
+.venv/
+*/venv/
+*/env/
+*/.venv/
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor Files
+.vscode/
+.idea/
+
+# Log Files
+logs/
+*.log
+
+# Data Files (Ignoring sample data directory)
+# data/
+
+# Configuration Files (Ignore environment-specific files)
+.env
+*.env
+
+# Docker (Ignoring build context files if any were generated)
+# docker-compose.override.yml

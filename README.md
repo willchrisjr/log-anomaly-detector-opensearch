@@ -11,10 +11,18 @@ This project is a proof-of-concept implementation of a framework designed to ing
 ├── data/                 # Sample data files
 │   └── mock_ssh.log      # Mock SSH log data
 ├── src/                  # Source code
-│   ├── ingest_logs.py    # Script to ingest logs into OpenSearch
-│   └── detect_anomalies.py # Script to detect failed login anomalies
-├── config/               # (Placeholder) Configuration files
-├── logs/                 # (Placeholder) Log output from scripts
+│   ├── ingest_logs.py    # Script to ingest logs (SSH, Apache Web) into OpenSearch
+│   ├── detect_anomalies.py # Script to detect anomalies (failed logins, high 404s) and dispatch alerts (runs scheduled)
+│   ├── config_loader.py  # Utility to load YAML configuration
+│   └── api.py            # Flask API server to serve failed login alerts
+├── frontend/             # Basic HTML/CSS/JS frontend (displays failed login alerts)
+│   ├── index.html        # Main HTML page
+│   ├── style.css         # CSS styles
+│   └── script.js         # JavaScript for API calls and display
+├── config/               # Configuration files
+│   └── config.yaml       # Main configuration file (YAML)
+├── logs/                 # Log output from scripts
+│   └── alerts.log        # Log file specifically for dispatched alerts
 └── scripts/              # (Placeholder) Utility or helper scripts
 ```
 
@@ -50,45 +58,75 @@ This project is a proof-of-concept implementation of a framework designed to ing
 ## Usage
 
 1.  **Ingest Logs:**
-    Run the ingestion script to parse the mock data and send it to OpenSearch. This script will also create the `ssh-logs` index if it doesn't exist.
+    Run the ingestion script, optionally specifying the log file and type. By default, it ingests `data/mock_access.log` as 'web'.
     ```bash
-    python3 src/ingest_logs.py
+    # Ingest web logs (default)
+    venv/bin/python3 src/ingest_logs.py 
+    
+    # Ingest SSH logs (specify file and type)
+    # venv/bin/python3 src/ingest_logs.py data/mock_ssh.log ssh 
     ```
-    *Note: If you run this multiple times, it will add duplicate log entries unless you delete the index first.*
+    *Note: The script creates the index with a combined mapping. If you re-run ingestion for a different log type, ensure the index exists or delete it first if mappings conflict.*
 
-2.  **Detect Anomalies:**
-    Run the detection script to query OpenSearch for the defined anomaly (>= 3 failed logins from the same IP in the last 24 hours).
+2.  **Run Anomaly Detection Scheduler:**
+    Run the detection script. It will run enabled detection rules (failed logins, high 404s) immediately and then schedule them periodically.
     ```bash
-    python3 src/detect_anomalies.py
+    # This script now runs continuously using APScheduler
+    python3 src/detect_anomalies.py 
     ```
-    The script will print any detected suspicious IPs as "ALERT" messages to the console.
+    to run periodically based on the `scheduler.interval_minutes` setting in 
+    `config/config.yaml`. Alerts are dispatched based on the `alerting` 
+    configuration (e.g., written to `logs/alerts.log`). Press Ctrl+C to stop 
+    the scheduler.
+
+3.  **(Optional) Run the API Server:**
+    To view recent *failed login* alerts via a web API, run the Flask server (using the venv):
+    ```bash
+    venv/bin/python3 src/api.py
+    ```
+    The API will be available at `http://localhost:5001`. Access alerts at `http://localhost:5001/api/alerts`. 
+    *Note: The current API only queries for failed login alerts.*
+
+4.  **View Frontend:**
+    Open the `frontend/index.html` file directly in your web browser (e.g., using `open frontend/index.html` on macOS). This page fetches and displays *failed login* alerts from the running API server.
+
+## Testing
+
+Basic unit tests for the log parsing logic are located in the `tests/` directory and can be run using `pytest`.
+
+1.  **Ensure Dependencies are Installed:** Make sure you have run `venv/bin/pip3 install -r requirements.txt`.
+2.  **Run Tests:** From the project root directory, run:
+    ```bash
+    PYTHONPATH=. venv/bin/pytest
+    ```
+    *(The `PYTHONPATH=.` part ensures that Python can find the `src` module).*
 
 ## Components
 
 *   **`docker-compose.yml`:** Defines the `opensearch-node1` and `opensearch-dashboards` services for local development. Security is disabled for ease of use (do not use this configuration in production).
 *   **`data/mock_ssh.log`:** Contains sample SSH log lines, including successful logins, failed logins, and disconnects.
-*   **`src/ingest_logs.py`:**
-    *   Connects to OpenSearch.
-    *   Parses log lines using regex.
-    *   Extracts timestamp, hostname, process, PID, message, and source IP address.
-    *   Creates the `ssh-logs` index with a basic mapping if it doesn't exist.
-    *   Uses the OpenSearch bulk API to index log entries efficiently.
-*   **`src/detect_anomalies.py`:**
-    *   Connects to OpenSearch.
-    *   Queries the `ssh-logs` index for documents matching "Failed password" within a configurable time window (currently 24 hours for demo purposes).
-    *   Uses OpenSearch aggregations to group failures by `ip_address`.
-    *   Filters the results using a `bucket_selector` to find IPs meeting the failure threshold.
-    *   Prints basic "ALERT" messages to the console for detected IPs.
+*   **`src/ingest_logs.py`:** Parses and ingests SSH or Apache web logs based on arguments. Creates index with combined mapping.
+*   **`src/config_loader.py`:** Utility to load `config.yaml`.
+*   **`src/detect_anomalies.py`:** Loads config, connects to OpenSearch, contains detection logic for failed logins and high 404s, dispatches alerts (log/webhook), uses APScheduler to run enabled detection jobs periodically.
+*   **`src/api.py`:** Flask API server providing `/api/alerts` endpoint (currently queries OpenSearch for *failed login* alerts) and `/health`.
+*   **`frontend/`:** Simple HTML/CSS/JS frontend that displays data from the `/api/alerts` endpoint.
+*   **`config/config.yaml`:** Central configuration for OpenSearch, detection rules (failed logins, high 404s with enable/disable flags), alerting, and scheduler interval.
+*   **`logs/alerts.log`:** Default file for file-based alerting.
 
 ## Future Enhancements
 
-*   **More Log Sources:** Add parsers and ingestion logic for other log types (firewall, application, OS).
-*   **Improved Parsing:** Use more robust parsing libraries or techniques instead of basic regex.
-*   **Configuration Management:** Move settings (OpenSearch host, index names, thresholds) to configuration files (e.g., in the `config/` directory).
+*   **More Log Sources & Parsers:** Add support for other log types (e.g., web server, firewall) and improve parsing robustness.
+*   **More Detection Rules:** Implement detection logic for different types of anomalies.
 *   **Real-time Ingestion:** Modify ingestion to tail log files or listen to log streams (e.g., Syslog, Beats).
-*   **Advanced Anomaly Detection:** Implement more sophisticated rules, statistical methods, or machine learning models for detection.
-*   **Real Alerting:** Integrate with actual notification systems (Slack, Teams, PagerDuty) via APIs.
-*   **Incident Logging:** Integrate with ticketing systems (JIRA, ServiceNow) to automatically create incident tickets.
-*   **Error Handling & Logging:** Add more robust error handling and structured logging (e.g., to files in the `logs/` directory).
-*   **Scheduling:** Use a scheduler (like `cron` or a Python library like `APScheduler`) to run the detection script periodically.
-*   **Security:** Enable and configure OpenSearch security features for production use.
+*   **API Enhancements:**
+    *   Query OpenSearch directly from the API instead of reading the log file.
+    *   Add filtering/searching capabilities to the `/api/alerts` endpoint.
+    *   Add endpoints for managing rules or configuration (more advanced).
+*   **Frontend Development:** Build a web UI (React, Vue, etc.) that consumes the `/api/alerts` endpoint.
+*   **Webhook Alert Testing:** Configure and test the generic webhook alerting.
+*   **Specific Alert Integrations:** Add dedicated functions for specific services like Slack, Teams, PagerDuty.
+*   **Incident Logging:** Integrate with ticketing systems (JIRA, ServiceNow).
+*   **Improved Error Handling & Logging:** Enhance robustness throughout the application.
+*   **Unit & Integration Tests:** Add tests to ensure components work correctly.
+*   **Production Deployment:** Containerize the API and scheduler for deployment (e.g., using Docker beyond the local OpenSearch setup).
+*   **Security:** Enable and configure OpenSearch security features; secure the API.

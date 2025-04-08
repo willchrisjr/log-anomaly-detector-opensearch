@@ -13,8 +13,15 @@ opensearch:
 detection:
   # Rule: Failed Logins
   failed_login_rule:
+    enabled: true # Enable/disable this specific rule
     time_window_minutes: 1440 # Lookback period (minutes)
     failure_threshold: 3    # Minimum failures to trigger alert
+
+  # Rule: High 404 Errors from Single IP
+  high_404_rule:
+    enabled: true # Enable/disable this specific rule
+    time_window_minutes: 60 # Lookback period (minutes)
+    threshold: 5    # Minimum 404s from one IP to trigger alert
 
 alerting:
   log_file:

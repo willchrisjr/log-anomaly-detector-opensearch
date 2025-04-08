@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security Alerts</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Recent Failed Login Alerts</h1>
+        <button id="refresh-button">Refresh Alerts</button>
+        <table id="alerts-table">
+            <thead>
+                <tr>
+                    <th>IP Address</th>
+                    <th>Failure Count</th>
+                </tr>
+            </thead>
+            <tbody id="alerts-table-body">
+                <tr>
+                    <td colspan="2">Loading alerts...</td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>

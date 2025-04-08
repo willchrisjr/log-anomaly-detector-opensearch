@@ -24,8 +24,8 @@ import time # For sleep in main loop
 import signal # For graceful shutdown
 import requests # For sending webhooks
 from opensearchpy import OpenSearch, RequestsHttpConnection
-from apscheduler.schedulers.blocking import BlockingScheduler # Import scheduler
-from config_loader import load_config # Import the loader
+from apscheduler.schedulers.blocking import BlockingScheduler 
+from .config_loader import load_config # Use relative import
 
 # Setup basic logging for script operation messages
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -54,6 +54,17 @@ try:
 except KeyError as e:
     logging.error(f"Missing required detection configuration key: {e}. Exiting.")
     sys.exit(1)
+
+# --- High 404 Rule Settings ---
+try:
+    HIGH_404_RULE = config['detection'].get('high_404_rule', {}) # Use .get for optional rule
+    HIGH_404_ENABLED = HIGH_404_RULE.get('enabled', False)
+    HIGH_404_TIME_WINDOW = HIGH_404_RULE.get('time_window_minutes', 60)
+    HIGH_404_THRESHOLD = HIGH_404_RULE.get('threshold', 10)
+except Exception as e: # Catch broader errors during config access
+    logging.warning(f"Issue reading high_404_rule configuration: {e}. Rule will be disabled.")
+    HIGH_404_ENABLED = False
+
 
 # --- Alerting Settings ---
 try:
@@ -134,10 +145,10 @@ def create_opensearch_client():
 
 # --- Alerting Functions ---
 
-def send_webhook_alert(alert_data):
-    """Sends alert data to the configured generic webhook."""
+def send_webhook_alert(alert_type, alert_details):
+    """Sends alert data (including type) to the configured generic webhook."""
     if not WEBHOOK_URL:
-        logging.error("Webhook URL is not configured. Cannot send webhook alert.")
+        logging.warning("Webhook URL is not configured or webhook alerting is disabled.")
         return
 
     headers = {'Content-Type': 'application/json'}
@@ -145,9 +156,9 @@ def send_webhook_alert(alert_data):
     
     # Structure the alert data as JSON payload
     payload = {
-        "alert_type": "failed_logins",
+        "alert_type": alert_type, # Use the passed alert type
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "details": alert_data # Pass the list of suspicious IPs
+        "details": alert_details # Pass the list of suspicious items
     }
     
     try:
@@ -157,22 +168,34 @@ def send_webhook_alert(alert_data):
     except requests.exceptions.RequestException as e:
         logging.error(f"Error sending alert to webhook {WEBHOOK_URL}: {e}")
 
-def dispatch_alert(suspicious_ips_list):
+def dispatch_alert(alert_type, alert_details_list):
     """Dispatches alerts based on configuration (log file, webhook)."""
-    if not suspicious_ips_list:
-        return # No alerts to dispatch
+    if not alert_details_list: return # No alerts to dispatch
 
-    alert_summary = f"Found {len(suspicious_ips_list)} suspicious IPs meeting threshold ({FAILURE_THRESHOLD})."
-    
+    count = len(alert_details_list)
+    # Customize summary based on type
+    if alert_type == "failed_logins":
+        alert_summary = f"[{alert_type.upper()}] Found {count} IPs meeting failed login threshold ({FAILURE_THRESHOLD})."
+    elif alert_type == "high_404s":
+         alert_summary = f"[{alert_type.upper()}] Found {count} IPs meeting high 404 threshold ({HIGH_404_THRESHOLD})."
+    else:
+         alert_summary = f"[{alert_type.upper()}] Found {count} suspicious entries."
+
     # Log to file if enabled
     if alert_logger:
         alert_logger.warning(alert_summary)
-        for item in suspicious_ips_list:
-             alert_logger.warning(f"  IP: {item['ip']}, Failures: {item['count']}")
+        for item in alert_details_list:
+             # Log different fields based on alert type
+             if alert_type == "failed_logins":
+                 alert_logger.warning(f"  IP: {item.get('ip', 'N/A')}, Failures: {item.get('count', 'N/A')}")
+             elif alert_type == "high_404s":
+                  alert_logger.warning(f"  Client IP: {item.get('client_ip', 'N/A')}, 404 Count: {item.get('count', 'N/A')}")
+             else:
+                 alert_logger.warning(f"  Item: {item}") # Fallback
     
     # Send to webhook if enabled
     if WEBHOOK_ALERT_ENABLED:
-        send_webhook_alert(suspicious_ips_list)
+        send_webhook_alert(alert_type, alert_details_list)
 
 
 # --- Detection Logic ---
@@ -255,10 +278,70 @@ def detect_failed_logins(client, index_name, time_window_minutes, failure_thresh
             logging.info("No suspicious IPs found meeting the threshold.")
 
     except Exception as e:
-        logging.error(f"Error querying or processing results from OpenSearch: {e}", exc_info=True)
+        logging.error(f"Error querying or processing results from OpenSearch for failed logins: {e}", exc_info=True)
 
 
-# --- Main Execution ---
+def detect_high_404s(client, index_name, time_window_minutes, threshold):
+    """
+    Queries OpenSearch for clients generating excessive 404 errors within a specified time window.
+    """
+    logging.info(f"Searching index '{index_name}' for IPs with >= {threshold} 404 errors in the last {time_window_minutes} minutes...")
+    
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start_time = now - datetime.timedelta(minutes=time_window_minutes)
+    start_time_iso = start_time.isoformat()
+
+    query = {
+        "size": 0,
+        "query": {
+            "bool": {
+                "must": [
+                    {"term": {"log_type": "web"}}, # Filter for web logs
+                    {"term": {"status_code": 404}}, # Filter for 404 status
+                    {"range": {"@timestamp": {"gte": start_time_iso}}}
+                ]
+            }
+        },
+        "aggs": {
+            "high_404s_by_ip": {
+                "terms": {"field": "client_ip", "size": 100}, # Aggregate on client_ip
+                "aggs": {
+                    "min_404_count": {
+                        "bucket_selector": {
+                            "buckets_path": {"count": "_count"},
+                            "script": f"params.count >= {threshold}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    try:
+        response = client.search(index=index_name, body=query)
+        suspicious_ips = []
+        aggregations = response.get('aggregations', {})
+        high_404s_agg = aggregations.get('high_404s_by_ip', {})
+        buckets = high_404s_agg.get('buckets', [])
+        
+        logging.info(f"High 404s query returned {len(buckets)} IPs meeting the threshold.")
+
+        for bucket in buckets:
+            ip = bucket.get('key')
+            count = bucket.get('doc_count')
+            if ip:
+                 suspicious_ips.append({"client_ip": ip, "count": count}) # Use client_ip key
+
+        if suspicious_ips:
+             dispatch_alert("high_404s", suspicious_ips) # Dispatch with specific type
+        else:
+            logging.info("No IPs found meeting the high 404 threshold.")
+
+    except Exception as e:
+        logging.error(f"Error querying or processing results from OpenSearch for high 404s: {e}", exc_info=True)
+
+
+# --- Job Function ---
 
 if __name__ == "__main__":
     logging.info("Starting anomaly detection script...")
@@ -278,25 +361,42 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"An unexpected error occurred during anomaly detection: {e}", exc_info=True)
 
-# --- Job Function ---
-def run_detection_job():
-    """Connects to OpenSearch and runs the detection logic."""
-    logging.info("Running scheduled detection job...")
+# --- Job Functions ---
+# Renamed for clarity
+def run_failed_login_detection_job():
+    """Connects to OpenSearch and runs the failed login detection logic."""
+    logging.info("Running scheduled failed login detection job...")
     try:
         os_client = create_opensearch_client() 
         if os_client.indices.exists(index=OPENSEARCH_INDEX_NAME): 
             detect_failed_logins(os_client, OPENSEARCH_INDEX_NAME, TIME_WINDOW_MINUTES, FAILURE_THRESHOLD) 
         else:
-            logging.error(f"Index '{OPENSEARCH_INDEX_NAME}' does not exist. Cannot run detection job.")
+            logging.error(f"Index '{OPENSEARCH_INDEX_NAME}' does not exist. Cannot run failed login detection.")
             
     except ValueError as ve: # Catch connection errors
-        logging.error(f"Connection error during detection job: {ve}")
+        logging.error(f"Connection error during failed login detection job: {ve}")
     except Exception as e:
-        logging.error(f"An unexpected error occurred during detection job: {e}", exc_info=True)
-    logging.info("Scheduled detection job finished.")
+        logging.error(f"An unexpected error occurred during failed login detection job: {e}", exc_info=True)
+    logging.info("Scheduled failed login detection job finished.")
+
+def run_high_404_detection_job():
+    """Connects to OpenSearch and runs the high 404 detection logic."""
+    logging.info("Running scheduled high 404 detection job...")
+    try:
+        os_client = create_opensearch_client() 
+        if os_client.indices.exists(index=OPENSEARCH_INDEX_NAME): 
+            detect_high_404s(os_client, OPENSEARCH_INDEX_NAME, HIGH_404_TIME_WINDOW, HIGH_404_THRESHOLD) 
+        else:
+            logging.error(f"Index '{OPENSEARCH_INDEX_NAME}' does not exist. Cannot run high 404 detection.")
+            
+    except ValueError as ve: # Catch connection errors
+        logging.error(f"Connection error during high 404 detection job: {ve}")
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during high 404 detection job: {e}", exc_info=True)
+    logging.info("Scheduled high 404 detection job finished.")
 
 
-# --- Main Execution ---
+# --- Main Scheduler Execution ---
 
 # Flag to control the main loop for graceful shutdown
 running = True
@@ -316,24 +416,51 @@ signal.signal(signal.SIGTERM, shutdown_handler)
 
 
 if __name__ == "__main__":
-    logging.info(f"Starting anomaly detection scheduler. Detection interval: {SCHEDULER_INTERVAL_MINUTES} minutes.")
-    
-    # Run the job once immediately on startup
-    run_detection_job() 
+    logging.info(f"Starting anomaly detection scheduler...")
     
     # Initialize the scheduler
-    scheduler = BlockingScheduler(timezone="UTC") # Use UTC timezone
+    scheduler = BlockingScheduler(timezone="UTC") 
 
-    # Add the job to run at the configured interval
+    # --- Schedule Failed Login Detector ---
+    # Check if the rule is enabled in config (assuming it is for now, add check if needed)
+    # failed_login_enabled = config['detection'].get('failed_login_rule', {}).get('enabled', False) # Example check
+    # if failed_login_enabled: # Add this check if enabling/disabling rules is desired
+    logging.info(f"Scheduling failed login detection every {SCHEDULER_INTERVAL_MINUTES} minutes.")
+    # Run once immediately
+    run_failed_login_detection_job() 
+    # Schedule subsequent runs
     scheduler.add_job(
-        run_detection_job, 
+        run_failed_login_detection_job, 
         'interval', 
-        minutes=SCHEDULER_INTERVAL_MINUTES,
-        id='failed_login_detector', # Give the job an ID
-        replace_existing=True # Replace if job with same ID exists (e.g., on restart)
+        minutes=SCHEDULER_INTERVAL_MINUTES, # Use the main interval for now
+        id='failed_login_detector', 
+        replace_existing=True 
     )
+    # else:
+    #    logging.info("Failed login detection rule is disabled in config.")
+
+    # --- Schedule High 404 Detector ---
+    if HIGH_404_ENABLED:
+        logging.info(f"Scheduling high 404 detection every {SCHEDULER_INTERVAL_MINUTES} minutes.") # Using same interval for now
+         # Run once immediately
+        run_high_404_detection_job()
+        # Schedule subsequent runs
+        scheduler.add_job(
+            run_high_404_detection_job,
+            'interval',
+            minutes=SCHEDULER_INTERVAL_MINUTES, # TODO: Make interval configurable per rule?
+            id='high_404_detector',
+            replace_existing=True
+        )
+    else:
+         logging.info("High 404 detection rule is disabled in config.")
+
     
-    logging.info("Scheduler started. Press Ctrl+C to exit.")
+    if not scheduler.get_jobs():
+         logging.warning("No detection jobs were scheduled. Check configuration. Exiting.")
+         sys.exit(0)
+
+    logging.info("Scheduler starting with configured jobs. Press Ctrl+C to exit.")
 
     try:
         # Start the scheduler (this blocks the main thread)

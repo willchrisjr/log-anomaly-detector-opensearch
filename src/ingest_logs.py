@@ -1,7 +1,8 @@
 """
-Ingests log data from a specified file into an OpenSearch index.
+Ingests log data from specified files into an OpenSearch index.
 
-This script reads log lines, parses them using regex, extracts relevant fields
+Supports parsing SSH and Apache Combined Log Format logs.
+Reads log lines, parses them using regex, extracts relevant fields
 (including timestamp and IP address), creates an OpenSearch index with an
 appropriate mapping if it doesn't exist, and uses the bulk API to index
 the processed log data.
@@ -9,193 +10,181 @@ the processed log data.
 import re
 import datetime
 import logging 
-import sys # For exiting on config error
+import sys 
+import os 
 from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
-from config_loader import load_config # Import the loader
+from .config_loader import load_config # Use relative import
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load configuration
+# --- Configuration Loading ---
 config = load_config()
 if not config:
     logging.error("Failed to load configuration. Exiting.")
     sys.exit(1)
 
-# Get settings from config
+# --- OpenSearch Settings ---
 try:
-    # Define constants from config for use in functions (could pass config dict instead)
     OPENSEARCH_HOST = config['opensearch']['host']
     OPENSEARCH_PORT = config['opensearch']['port']
-    # INDEX_NAME constant is no longer needed globally, read from config where needed
+    OPENSEARCH_INDEX_NAME = config['opensearch']['index_name']
     # Optional auth - add later if needed
-    # OPENSEARCH_USER = config['opensearch'].get('user') 
-    # OPENSEARCH_PASSWORD = config['opensearch'].get('password')
-    # USE_SSL = config['opensearch'].get('use_ssl', False)
-    # VERIFY_CERTS = config['opensearch'].get('verify_certs', False)
-    
-    # Assuming log file path is still relative or defined elsewhere if needed
-    # If LOG_FILE_PATH needs to be configurable, add it to config.yaml
-    LOG_FILE_PATH = 'data/mock_ssh.log' 
-
 except KeyError as e:
-    logging.error(f"Missing required configuration key: {e}. Exiting.")
+    logging.error(f"Missing required opensearch configuration key: {e}. Exiting.")
     sys.exit(1)
 
+# --- Log File Paths (Consider making these configurable) ---
+# For now, we determine which file to ingest based on an argument or default
+# Defaulting to web log for Phase 9 testing
+DEFAULT_LOG_FILE = 'data/mock_access.log' 
+DEFAULT_LOG_TYPE = 'web' 
 
-# Regex to parse the log line (simple example)
-# Example: Apr 8 10:15:30 server1 sshd[1234]: Message
-log_pattern = re.compile(
+# --- Regex Patterns ---
+
+# SSH Log Regex
+ssh_log_pattern = re.compile(
     r"^(?P<month>\w{3})\s+(?P<day>\d{1,2})\s+(?P<time>\d{2}:\d{2}:\d{2})\s+"
     r"(?P<hostname>\S+)\s+(?P<process>\S+)\[(?P<pid>\d+)\]:\s+"
     r"(?P<message>.*)$"
 )
+ssh_ip_pattern = re.compile(r"from\s+(?P<ip_address>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
 
-# Regex to extract IP (reused from detect_anomalies)
-ip_pattern = re.compile(r"from\s+(?P<ip_address>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})")
+# Apache Combined Log Format Regex
+apache_log_pattern = re.compile(
+    r'^(?P<client_ip>\S+)\s+'          # Client IP
+    r'(?P<ident>\S+)\s+'               # RFC 1413 identity (usually '-')
+    r'(?P<auth>\S+)\s+'                # Userid of person requesting (usually '-')
+    r'\[(?P<timestamp_str>[^\]]+)\]\s+' # Timestamp [dd/Mon/YYYY:HH:MM:SS +ZZZZ]
+    r'"(?P<method>[A-Z]+)\s+'          # Request method (GET, POST, etc.)
+    r'(?P<request_path>\S+)\s+'        # Requested path
+    r'(?P<http_version>HTTP/\d\.\d)"\s+' # HTTP version
+    r'(?P<status_code>\d{3})\s+'       # Status code (e.g., 200, 404)
+    r'(?P<bytes_sent>\S+)\s+'          # Bytes sent ('-' if none)
+    r'"(?P<referrer>[^"]*)"\s+'        # Referrer URL
+    r'"(?P<user_agent>[^"]*)"$'        # User agent string
+)
 
-def extract_ip_from_message(message):
-    """Extracts IP address from the log message."""
-    match = ip_pattern.search(message)
-    if match:
-        return match.group("ip_address")
-    return None
+# --- Parsing Functions ---
 
-def parse_log_line(line):
-    """
-    Parses a single log line based on the defined regex pattern.
+def parse_ssh_log_line(line):
+    """Parses a single SSH log line."""
+    match = ssh_log_pattern.match(line)
+    if not match: return None
+    data = match.groupdict()
+    data['log_type'] = 'ssh'
+    ip_match = ssh_ip_pattern.search(data['message'])
+    if ip_match: data['client_ip'] = ip_match.group("ip_address") # Standardize field name
+    try:
+        current_year = datetime.datetime.now().year
+        ts_str = f"{current_year} {data['month']} {data['day']} {data['time']}"
+        ts = datetime.datetime.strptime(ts_str, "%Y %b %d %H:%M:%S")
+        local_tz = datetime.datetime.now().astimezone().tzinfo
+        aware_ts = ts.replace(tzinfo=local_tz)
+        data['@timestamp'] = aware_ts.isoformat()
+    except ValueError as e:
+        logging.warning(f"SSH ts parse error: {e}. Using current UTC.")
+        data['@timestamp'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    del data['month'], data['day'], data['time']
+    data['log_original'] = line.strip()
+    data['pid'] = int(data['pid']) if data.get('pid') else None
+    return data
 
-    Extracts fields like timestamp, hostname, process, PID, message, and IP address.
-    Attempts to convert the log timestamp to ISO 8601 format.
+def parse_apache_log_line(line):
+    """Parses a single Apache Combined Log Format line."""
+    match = apache_log_pattern.match(line)
+    if not match: return None
+    data = match.groupdict()
+    data['log_type'] = 'web'
+    try:
+        ts = datetime.datetime.strptime(data['timestamp_str'], "%d/%b/%Y:%H:%M:%S %z")
+        data['@timestamp'] = ts.isoformat()
+    except ValueError as e:
+        logging.warning(f"Apache ts parse error: {e}. Using current UTC.")
+        data['@timestamp'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    del data['timestamp_str']
+    try: data['status_code'] = int(data['status_code'])
+    except ValueError: data['status_code'] = None 
+    try: data['bytes_sent'] = int(data['bytes_sent'])
+    except ValueError: data['bytes_sent'] = 0
+    if data['ident'] == '-': data['ident'] = None
+    if data['auth'] == '-': data['auth'] = None
+    if data['referrer'] == '-': data['referrer'] = None
+    data['log_original'] = line.strip()
+    return data
 
-    Args:
-        line (str): A single line from the log file.
+def parse_log_line(line, log_type):
+    """Dispatcher function to parse log line based on type."""
+    if log_type == 'ssh': return parse_ssh_log_line(line)
+    elif log_type == 'web': return parse_apache_log_line(line)
+    else:
+        logging.warning(f"Unsupported log_type for parsing: {log_type}")
+        return None
 
-    Returns:
-        dict: A dictionary containing the parsed fields, or None if parsing fails.
-    """
-    match = log_pattern.match(line)
-    if match:
-        data = match.groupdict()
-        
-        # Attempt to create a proper timestamp
-        try:
-            # Assuming current year for simplicity
-            current_year = datetime.datetime.now().year
-            timestamp_str = f"{current_year} {data['month']} {data['day']} {data['time']}"
-            timestamp = datetime.datetime.strptime(timestamp_str, "%Y %b %d %H:%M:%S")
-            # Make timestamp timezone-aware (assuming local time if not specified, adjust if needed)
-            # For simplicity, let's assume logs are in local time and convert to UTC for storage
-            # A more robust solution would handle timezone info if present in logs
-            local_tz = datetime.datetime.now().astimezone().tzinfo
-            aware_timestamp = timestamp.replace(tzinfo=local_tz)
-            data['@timestamp'] = aware_timestamp.isoformat()
-        except ValueError as e:
-            logging.warning(f"Could not parse timestamp from log line: {line.strip()}. Error: {e}. Using current UTC time.")
-            # Fallback if parsing fails - use timezone-aware UTC now
-            data['@timestamp'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            
-        # Remove original time fields if timestamp is created
-        del data['month']
-        del data['day']
-        del data['time']
-        
-        # Add the raw log line as well
-        data['log_original'] = line.strip()
-        
-        # Convert PID to integer
-        data['pid'] = int(data['pid'])
-
-        # Extract IP address if present in the message
-        ip_address = extract_ip_from_message(data['message'])
-        if ip_address:
-            data['ip_address'] = ip_address
-        
-        return data
-    return None # Return None if line doesn't match pattern
+# --- OpenSearch Client & Index ---
 
 def create_opensearch_client():
-    """
-    Creates and returns an OpenSearch client instance.
-
-    Connects to the configured OpenSearch host and port.
-    Verifies the connection before returning the client.
-
-    Returns:
-        OpenSearch: An instance of the OpenSearch client.
-    
-    Raises:
-        ValueError: If the connection to OpenSearch fails.
-    """
-    # TODO: Add support for SSL and authentication based on config
-    client = OpenSearch(
-        # Using constants derived from config at the top level
-        hosts=[{'host': OPENSEARCH_HOST, 'port': OPENSEARCH_PORT}], 
-        http_conn_options={'timeout': 10}, 
-        use_ssl=False, # Replace with USE_SSL from config if added
-        verify_certs=False, # Replace with VERIFY_CERTS from config if added
-        ssl_show_warn=False, 
-        connection_class=RequestsHttpConnection # Recommended for compatibility
-    )
-    # Verify connection
-    if not client.ping():
-        logging.error("Connection to OpenSearch failed")
-        raise ValueError("Connection to OpenSearch failed")
-    logging.info("Successfully connected to OpenSearch.")
-    return client
+    """Creates and returns an OpenSearch client instance."""
+    try:
+        client = OpenSearch(
+            hosts=[{'host': OPENSEARCH_HOST, 'port': OPENSEARCH_PORT}],
+            http_conn_options={'timeout': 10},
+            use_ssl=False, # TODO: Read from config
+            verify_certs=False, # TODO: Read from config
+            ssl_show_warn=False,
+            connection_class=RequestsHttpConnection
+        )
+        if not client.ping(): raise ValueError("Connection failed")
+        logging.info("Successfully connected to OpenSearch.")
+        return client
+    except Exception as e:
+        logging.error(f"Failed to connect to OpenSearch: {e}")
+        raise 
 
 def create_index_if_not_exists(client, index):
-    """
-    Creates the specified OpenSearch index with a predefined mapping if it doesn't already exist.
-
-    Args:
-        client (OpenSearch): The OpenSearch client instance.
-        index (str): The name of the index to create.
-    """
+    """Creates the index with a combined mapping if it doesn't exist."""
     if not client.indices.exists(index=index):
         logging.info(f"Index '{index}' not found. Creating...")
         try:
-            # A simple index mapping, can be expanded later
             mapping = {
                 "properties": {
                     "@timestamp": {"type": "date"},
+                    "log_type": {"type": "keyword"}, 
                     "hostname": {"type": "keyword"},
                     "process": {"type": "keyword"},
                     "pid": {"type": "integer"},
-                    "message": {"type": "text"},
-                    "ip_address": {"type": "keyword"}, # Add keyword field for IP
-                    "log_original": {"type": "text", "index": False} # Don't index raw log by default
+                    "message": {"type": "text"}, 
+                    "client_ip": {"type": "keyword"}, 
+                    "ident": {"type": "keyword"},
+                    "auth": {"type": "keyword"},
+                    "method": {"type": "keyword"},
+                    "request_path": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 256}}},
+                    "http_version": {"type": "keyword"},
+                    "status_code": {"type": "integer"},
+                    "bytes_sent": {"type": "long"},
+                    "referrer": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 1024}}},
+                    "user_agent": {"type": "text", "fields": {"keyword": {"type": "keyword", "ignore_above": 1024}}},
+                    "log_original": {"type": "text", "index": False} 
                 }
             }
             client.indices.create(index=index, body={'mappings': mapping})
             logging.info(f"Index '{index}' created successfully.")
         except Exception as e:
             logging.error(f"Error creating index '{index}': {e}")
-            # Decide if you want to proceed without mapping or raise error
-            raise e # Re-raise the exception to halt execution if index creation fails
+            raise 
     else:
         logging.info(f"Index '{index}' already exists.")
 
-def generate_actions(log_file, index_name):
-    """
-    Reads a log file line by line, parses each line, and yields actions formatted for the OpenSearch bulk API.
+# --- Bulk Ingestion ---
 
-    Args:
-        log_file (str): The path to the log file.
-        index_name (str): The name of the target OpenSearch index.
-
-    Yields:
-        dict: An action dictionary for the OpenSearch bulk helper.
-    """
+def generate_actions(log_file, index_name, log_type):
+    """Reads log file, parses lines, yields actions for bulk API."""
     try:
         with open(log_file, 'r') as f:
             for line in f:
-                parsed_data = parse_log_line(line)
+                parsed_data = parse_log_line(line, log_type)
                 if parsed_data:
-                    yield {
-                        "_index": index_name,
-                        "_source": parsed_data
-                    }
+                    yield {"_index": index_name, "_source": parsed_data}
                 else:
                     logging.warning(f"Skipping unparseable line: {line.strip()}")
     except FileNotFoundError:
@@ -203,33 +192,39 @@ def generate_actions(log_file, index_name):
     except Exception as e:
         logging.error(f"Error reading log file {log_file}: {e}")
 
+# --- Main Execution ---
 
 if __name__ == "__main__":
-    logging.info("Starting log ingestion script...")
+    # Basic argument parsing (optional, could use argparse)
+    log_file_to_ingest = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_LOG_FILE
+    log_type_to_ingest = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_LOG_TYPE
+    
+    # Validate log type
+    if log_type_to_ingest not in ['ssh', 'web']:
+        logging.error(f"Invalid log_type specified: {log_type_to_ingest}. Use 'ssh' or 'web'.")
+        sys.exit(1)
+
+    logging.info(f"Starting log ingestion script for type '{log_type_to_ingest}'...")
     
     try:
-        # Client uses constants derived from config
         os_client = create_opensearch_client() 
-        # Ensure index exists with the correct mapping before ingesting
-        # Pass index name directly from config dict
         index_name_from_config = config['opensearch']['index_name']
+        # Ensure index exists with the correct mapping
+        # NOTE: If mapping changes, you MUST delete the index first
         create_index_if_not_exists(os_client, index_name_from_config) 
         
-        logging.info(f"Reading logs from {LOG_FILE_PATH} and indexing to '{index_name_from_config}'...")
+        logging.info(f"Reading '{log_type_to_ingest}' logs from {log_file_to_ingest} and indexing to '{index_name_from_config}'...")
         
-        # Use bulk helper for efficiency
         success_count, errors = helpers.bulk(
             os_client,
-             # Pass index name directly from config dict
-            generate_actions(LOG_FILE_PATH, index_name_from_config),
-            chunk_size=500,  # TODO: Make chunk_size configurable?
-            request_timeout=60 # TODO: Make timeout configurable?
+            generate_actions(log_file_to_ingest, index_name_from_config, log_type_to_ingest), 
+            chunk_size=500,  
+            request_timeout=60 
         )
         
         logging.info(f"Successfully indexed {success_count} log entries.")
         if errors:
             logging.error(f"Encountered {len(errors)} errors during indexing.")
-            # Log first few errors for debugging
             for i, error in enumerate(errors[:5]):
                  logging.error(f"  Bulk Indexing Error {i+1}: {error}")
 

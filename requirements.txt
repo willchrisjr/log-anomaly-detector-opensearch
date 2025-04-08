@@ -2,3 +2,6 @@ opensearch-py
 PyYAML
 requests
 APScheduler
+Flask
+Flask-Cors
+pytest

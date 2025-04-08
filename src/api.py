@@ -1,24 +1,21 @@
 """
 Backend API Server using Flask.
 
-Provides endpoints to interact with the security automation framework,
-initially focusing on retrieving recent alerts.
+Provides endpoints to retrieve structured alerts from the OpenSearch alert index.
 """
 import logging
 import sys
 import os
 import json
-import datetime # Added
+import datetime 
 from flask import Flask, jsonify, request 
 from flask_cors import CORS 
-from opensearchpy import OpenSearch, RequestsHttpConnection # Added
-from config_loader import load_config 
+from opensearchpy import OpenSearch, RequestsHttpConnection 
+from config_loader import load_config # Direct import is correct here, no change needed.
 
 # --- Setup ---
-# Basic logging for the API server
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - API - %(levelname)s - %(message)s')
 
-# Load configuration
 config = load_config()
 if not config:
     logging.error("API failed to load configuration. Exiting.")
@@ -28,27 +25,17 @@ if not config:
 try:
     OPENSEARCH_HOST = config['opensearch']['host']
     OPENSEARCH_PORT = config['opensearch']['port']
-    OPENSEARCH_INDEX_NAME = config['opensearch']['index_name']
+    # Get the ALERT index name, default if not found
+    ALERT_INDEX_NAME = config['opensearch'].get('alert_index_name', 'security-alerts-details') 
 except KeyError as e:
     logging.error(f"API missing required opensearch configuration key: {e}. Exiting.")
     sys.exit(1)
-
-# --- Detection Settings (needed for query) ---
-try:
-    DETECTION_RULE = config['detection']['failed_login_rule']
-    TIME_WINDOW_MINUTES = DETECTION_RULE['time_window_minutes']
-    FAILURE_THRESHOLD = DETECTION_RULE['failure_threshold']
-except KeyError as e:
-    logging.error(f"API missing required detection configuration key: {e}. Exiting.")
-    sys.exit(1)
-
 
 # Initialize Flask app
 app = Flask(__name__)
 CORS(app) # Enable CORS for all routes
 
 # --- OpenSearch Client ---
-# Duplicated from detect_anomalies.py - consider refactoring to utils later
 def create_opensearch_client():
     """Creates and returns an OpenSearch client instance."""
     try:
@@ -60,83 +47,58 @@ def create_opensearch_client():
             ssl_show_warn=False,
             connection_class=RequestsHttpConnection
         )
-        if not client.ping():
-            raise ValueError("Connection failed")
+        if not client.ping(): raise ValueError("Connection failed")
         logging.info("API successfully connected to OpenSearch.")
         return client
     except Exception as e:
         logging.error(f"API failed to connect to OpenSearch: {e}")
-        raise # Re-raise exception to be caught by endpoint handler
-
+        raise 
 
 # --- API Endpoints ---
 @app.route('/api/alerts', methods=['GET'])
-def get_alerts():
+def get_alerts_from_opensearch():
     """
-    API endpoint to retrieve IPs with recent failed logins exceeding threshold.
-    Queries OpenSearch directly based on config settings.
+    API endpoint to retrieve recent alerts directly from the OpenSearch alert index.
+    Accepts an optional 'limit' query parameter.
     """
-    logging.info("API request received for /api/alerts")
+    try:
+        limit = int(request.args.get('limit', 100)) # Default to 100 alerts
+    except ValueError:
+        return jsonify({"error": "Invalid 'limit' parameter. Must be an integer."}), 400
+
+    logging.info(f"API request received for /api/alerts (from OpenSearch) with limit={limit}")
     
     try:
         os_client = create_opensearch_client()
     except Exception:
          return jsonify({"error": "API could not connect to OpenSearch"}), 500
 
-    # Calculate time window
-    now = datetime.datetime.now(datetime.timezone.utc)
-    start_time = now - datetime.timedelta(minutes=TIME_WINDOW_MINUTES)
-    start_time_iso = start_time.isoformat()
-
-    # Build the aggregation query (same as in detect_anomalies.py)
+    # Query the alert index, sort by timestamp descending
     query = {
-        "size": 0,
-        "query": {
-            "bool": {
-                "must": [
-                    {"match_phrase": {"message": "Failed password"}},
-                    {"range": {"@timestamp": {"gte": start_time_iso}}}
-                ]
-            }
-        },
-        "aggs": {
-            "failed_logins_by_ip": {
-                "terms": {"field": "ip_address", "size": 100}, 
-                "aggs": {
-                    "min_failure_count": {
-                        "bucket_selector": {
-                            "buckets_path": {"count": "_count"},
-                            "script": f"params.count >= {FAILURE_THRESHOLD}"
-                        }
-                    }
-                }
-            }
-        }
+        "size": limit,
+        "query": {"match_all": {}}, # Get all alert types for now
+        "sort": [
+            {"alert_timestamp": {"order": "desc"}}
+        ]
     }
 
     try:
-        # Execute the search
-        response = os_client.search(index=OPENSEARCH_INDEX_NAME, body=query)
+        response = os_client.search(index=ALERT_INDEX_NAME, body=query)
         
-        # Process the aggregation results into structured data
-        results_list = []
-        aggregations = response.get('aggregations', {})
-        failed_logins_agg = aggregations.get('failed_logins_by_ip', {})
-        buckets = failed_logins_agg.get('buckets', [])
+        hits = response.get('hits', {}).get('hits', [])
+        results_list = [hit['_source'] for hit in hits] # Extract the source documents
         
-        logging.info(f"API query found {len(buckets)} IPs meeting the threshold.")
-
-        for bucket in buckets:
-            ip = bucket.get('key')
-            count = bucket.get('doc_count')
-            if ip:
-                 results_list.append({"ip": ip, "count": count})
-
+        logging.info(f"API query found {len(results_list)} alert documents in {ALERT_INDEX_NAME}.")
         return jsonify({"alerts": results_list})
 
     except Exception as e:
-        logging.error(f"API error querying OpenSearch: {e}", exc_info=True)
-        return jsonify({"error": "Failed to query OpenSearch for alerts"}), 500
+        # Handle case where alert index might not exist yet
+        if "index_not_found_exception" in str(e):
+             logging.warning(f"Alert index '{ALERT_INDEX_NAME}' not found. Returning empty list.")
+             return jsonify({"alerts": []})
+        else:
+             logging.error(f"API error querying OpenSearch alert index: {e}", exc_info=True)
+             return jsonify({"error": "Failed to query OpenSearch for alerts"}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -146,16 +108,14 @@ def health_check():
 # --- Main Execution ---
 if __name__ == '__main__':
     logging.info("Starting Flask API server...")
-    # Run the app (use development server for now)
-    # Host '0.0.0.0' makes it accessible on the network, not just localhost
-    # Use port 5001 as 5000 might be in use
     api_port = 5001 
     logging.info(f"Attempting to start API on port {api_port}")
     try:
         app.run(host='0.0.0.0', port=api_port, debug=False) 
-        # Note: debug=True is helpful for development but should be False in production
     except OSError as e:
         if "Address already in use" in str(e):
              logging.error(f"Port {api_port} is already in use. Please try a different port or stop the existing service.")
         else:
              logging.error(f"Failed to start Flask server: {e}")
+    except Exception as e:
+         logging.error(f"An unexpected error occurred starting the API server: {e}")

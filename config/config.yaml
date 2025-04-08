@@ -3,7 +3,8 @@
 opensearch:
   host: 'localhost'
   port: 9200
-  index_name: 'ssh-logs'
+  index_name: 'ssh-logs' # Index for raw logs
+  alert_index_name: 'security-alerts-details' # Index for generated alerts
   # Optional: Add credentials if security is enabled
   # user: 'admin'
   # password: 'your_password'
@@ -39,4 +40,4 @@ alerting:
 
 scheduler:
   # How often to run the detection logic
-  interval_minutes: 10
+  interval_minutes: 5

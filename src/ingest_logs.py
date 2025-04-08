@@ -13,7 +13,7 @@ import logging
 import sys 
 import os 
 from opensearchpy import OpenSearch, RequestsHttpConnection, helpers
-from .config_loader import load_config # Use relative import
+from config_loader import load_config # Use direct import (run with PYTHONPATH=.)
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')

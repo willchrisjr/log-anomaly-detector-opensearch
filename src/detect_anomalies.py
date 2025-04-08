@@ -1,10 +1,10 @@
 """
-Detects anomalies in log data stored in OpenSearch.
+Detects anomalies in log data stored in OpenSearch based on configured rules.
 
-Supports multiple detection rules (failed logins, high 404s).
-Queries OpenSearch based on configured rules, dispatches alerts 
-(to log file, webhook, and/or a dedicated OpenSearch alert index), 
-and runs detection jobs periodically via a scheduler.
+Supports multiple detection rules (e.g., failed logins, high 404s).
+Queries the main log index based on configured rules, dispatches alerts 
+via configured methods (log file, webhook, OpenSearch alert index), 
+and runs detection jobs periodically via APScheduler.
 """
 import re
 import datetime
@@ -202,10 +202,19 @@ def index_alert_to_opensearch(client, alert_type, alert_details_list, alert_summ
             else:
                 logging.info(f"Successfully indexed {success} alert document(s) to {ALERT_INDEX_NAME}.")
         except Exception as e:
-            logging.error(f"Failed to index alerts to OpenSearch: {e}", exc_info=True)
+             logging.error(f"Failed to index alerts to OpenSearch: {e}", exc_info=True)
 
 def dispatch_alert(os_client, alert_type, alert_details_list):
-    """Dispatches alerts based on configuration (log file, webhook, alert index)."""
+    """
+    Dispatches alerts based on configuration.
+
+    Logs to console, optionally logs to file, sends to webhook, and indexes to OpenSearch.
+
+    Args:
+        os_client (OpenSearch): The OpenSearch client instance (for indexing).
+        alert_type (str): The type of alert (e.g., 'failed_logins', 'high_404s').
+        alert_details_list (list): A list of dictionaries containing alert details.
+    """
     if not alert_details_list: return 
 
     count = len(alert_details_list)
@@ -242,7 +251,15 @@ def dispatch_alert(os_client, alert_type, alert_details_list):
 # --- Detection Logic ---
 
 def detect_failed_logins(client, index_name, time_window_minutes, failure_threshold):
-    """Queries OpenSearch for multiple failed logins from the same IP."""
+    """
+    Queries OpenSearch for multiple failed SSH logins from the same IP.
+
+    Args:
+        client (OpenSearch): The OpenSearch client instance.
+        index_name (str): Name of the index containing log data.
+        time_window_minutes (int): Lookback period in minutes.
+        failure_threshold (int): Minimum failures to trigger an alert.
+    """
     logging.info(f"Running detection: Failed Logins (Threshold: {failure_threshold}, Window: {time_window_minutes}m)")
     now = datetime.datetime.now(datetime.timezone.utc)
     start_time = now - datetime.timedelta(minutes=time_window_minutes)
@@ -303,7 +320,10 @@ def detect_high_404s(client, index_name, time_window_minutes, threshold):
 
 # --- Job Functions ---
 def run_detection_jobs():
-    """Connects to OpenSearch and runs all enabled detection jobs."""
+    """
+    Connects to OpenSearch and runs all detection jobs that are enabled in the config.
+    Ensures the alert index exists before running detections.
+    """
     logging.info("Running scheduled detection jobs...")
     try:
         os_client = create_opensearch_client() 

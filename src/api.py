@@ -1,7 +1,8 @@
 """
 Backend API Server using Flask.
 
-Provides endpoints to retrieve structured alerts from the OpenSearch alert index.
+Provides endpoints to retrieve structured alerts from the OpenSearch alert index
+and raw logs from the main OpenSearch log index. Also includes a health check.
 """
 import logging
 import sys
@@ -25,8 +26,8 @@ if not config:
 try:
     OPENSEARCH_HOST = config['opensearch']['host']
     OPENSEARCH_PORT = config['opensearch']['port']
-    # Get the ALERT index name, default if not found
-    ALERT_INDEX_NAME = config['opensearch'].get('alert_index_name', 'security-alerts-details') 
+    OPENSEARCH_INDEX_NAME = config['opensearch']['index_name'] # Read the main log index name
+    ALERT_INDEX_NAME = config['opensearch'].get('alert_index_name', 'security-alerts-details') # Get the alert index name
 except KeyError as e:
     logging.error(f"API missing required opensearch configuration key: {e}. Exiting.")
     sys.exit(1)
@@ -58,8 +59,10 @@ def create_opensearch_client():
 @app.route('/api/alerts', methods=['GET'])
 def get_alerts_from_opensearch():
     """
-    API endpoint to retrieve recent alerts directly from the OpenSearch alert index.
-    Accepts an optional 'limit' query parameter.
+    API endpoint to retrieve recent alert documents from the OpenSearch alert index.
+    
+    Accepts an optional 'limit' query parameter (default 100).
+    Returns alerts sorted by alert_timestamp descending.
     """
     try:
         limit = int(request.args.get('limit', 100)) # Default to 100 alerts
@@ -97,8 +100,72 @@ def get_alerts_from_opensearch():
              logging.warning(f"Alert index '{ALERT_INDEX_NAME}' not found. Returning empty list.")
              return jsonify({"alerts": []})
         else:
-             logging.error(f"API error querying OpenSearch alert index: {e}", exc_info=True)
-             return jsonify({"error": "Failed to query OpenSearch for alerts"}), 500
+            # Corrected indentation below
+            logging.error(f"API error querying OpenSearch alert index: {e}", exc_info=True)
+            return jsonify({"error": "Failed to query OpenSearch for alerts"}), 500
+
+@app.route('/api/raw_logs', methods=['GET'])
+def get_raw_logs():
+    """
+    API endpoint to retrieve recent raw logs from the main OpenSearch log index.
+
+    Query Parameters:
+        log_type (str, optional): Filter logs by type ('ssh', 'web').
+        limit (int, optional): Maximum number of logs to return (default 10).
+
+    Returns:
+        JSON response containing a list of log documents ('logs' key) or an error.
+    """
+    log_type = request.args.get('log_type') 
+    try:
+        limit = int(request.args.get('limit', 10)) # Default to 10 lines
+    except ValueError:
+        return jsonify({"error": "Invalid 'limit' parameter. Must be an integer."}), 400
+
+    logging.info(f"API request received for /api/raw_logs (type: {log_type}, limit: {limit})")
+
+    try:
+        os_client = create_opensearch_client()
+    except Exception:
+         return jsonify({"error": "API could not connect to OpenSearch"}), 500
+
+    # Base query: sort by timestamp descending
+    query = {
+        "size": limit,
+        "query": {"match_all": {}}, 
+        "sort": [
+            {"@timestamp": {"order": "desc"}}
+        ]
+    }
+    
+    # Add filter if log_type is specified
+    if log_type:
+         query["query"] = {
+             "bool": {
+                 "filter": [
+                     {"term": {"log_type": log_type}}
+                 ]
+             }
+         }
+
+    try:
+        response = os_client.search(index=OPENSEARCH_INDEX_NAME, body=query) # Query main log index
+        
+        hits = response.get('hits', {}).get('hits', [])
+        results_list = [hit['_source'] for hit in hits] 
+        
+        logging.info(f"API query found {len(results_list)} raw log documents in {OPENSEARCH_INDEX_NAME}.")
+        return jsonify({"logs": results_list})
+
+    except Exception as e:
+        # Handle case where log index might not exist yet
+        if "index_not_found_exception" in str(e):
+             logging.warning(f"Log index '{OPENSEARCH_INDEX_NAME}' not found. Returning empty list.")
+             return jsonify({"logs": []})
+        else:
+             logging.error(f"API error querying OpenSearch log index: {e}", exc_info=True)
+             return jsonify({"error": "Failed to query OpenSearch for raw logs"}), 500
+
 
 @app.route('/health', methods=['GET'])
 def health_check():
